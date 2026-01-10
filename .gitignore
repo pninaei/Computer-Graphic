@@ -1,0 +1,17 @@
+# Unity generated folders
+[Ll]ibrary/
+[Ll]ogs/
+[Tt]emp/
+[Uu]serSettings/
+Obj/
+Build/
+Builds/
+MemoryCaptures/
+
+# OS junk
+.DS_Store
+__MACOSX/
+
+# IDE
+.vscode/
+.idea/
