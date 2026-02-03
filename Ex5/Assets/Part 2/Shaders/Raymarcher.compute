@@ -1,0 +1,163 @@
+#pragma kernel CSRaymarch
+
+#include "IBLUtils.hlsl" 
+#include "Assets/Part 1/Shaders/SHCommon.hlsl"
+
+RWTexture2D<float4> Result;
+TextureCube<float4> _EnvTex;
+SamplerState sampler_EnvTex;
+StructuredBuffer<float3> _SHCoefficients;
+
+float _Roughness;
+float _Metallic;
+float4x4 _InvViewMatrix;
+float4x4 _InvProjectionMatrix;
+float3 _WorldSpaceCameraPos;
+float4 _Time;
+
+// --- Constants ---
+#define MAX_STEPS 100
+#define MAX_DIST 100.0
+#define SURF_DIST 0.001
+
+// --- Math & SDFs ---
+float3 rotateX(float3 p, float angle)
+{
+    float s = sin(angle);
+    float c = cos(angle);
+    return float3(p.x, c * p.y + s * p.z, -s * p.y + c * p.z);
+}
+
+float sdSphere(float3 p, float s) { return length(p) - s; }
+
+float sdBox(float3 p, float3 b)
+{
+    float3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+float sdTorus(float3 p, float2 t)
+{
+    float2 q = float2(length(p.xz) - t.x, p.y);
+    return length(q) - t.y;
+}
+
+float smin(float a, float b, float k)
+{
+    k *= 1.0 / (1.0 - sqrt(0.5));
+    float h = max(k - abs(a - b), 0.0) / k;
+    return min(a, b) - k * 0.5 * (1.0 + h - sqrt(1.0 - h * (h - 2.0)));
+}
+
+// --- Scene Logic ---
+float map(float3 position)
+{
+    float time = _Time.y;
+    float timeLoop = abs(sin(time)) * .6;
+    
+    // TODO: implement a scene as follows.
+    // Set a sphere of size 0.8 at position (0, 0, 5)
+    float sphere = sdSphere(position - float3(0, 0, 5), 0.8);
+    
+    // Set a cube of size 0.7 at position (2.5, -0.2, 4)
+    float cube = sdBox(position - float3(2.5, -0.2, 4), float3(0.7, 0.7, 0.7));
+    
+    // Set a torus of size 0.6 and thickness 0.2 at position (-2.5, 0, 5.5)
+    float3 torusPos = position - float3(-2.5, 0, 5.5);
+    torusPos = rotateX(torusPos, time);  
+    float torus = sdTorus(torusPos, float2(0.6, 0.2));
+    
+    // "Merge" the sphere and cube with `smin` as a factor of `timeLoop`
+    float merged = smin(sphere, cube, timeLoop);
+
+    
+    return min(merged, torus);
+    
+}
+
+float3 getNormal(float3 position)
+{
+    float e = 1e-4;
+
+    // TODO: implement the method to get a normal in the scene for the given point p.
+    float3 n;
+    // partial deriviants
+    n.x = map(position + float3(e, 0, 0)) - map(position - float3(e, 0, 0));
+    n.y = map(position + float3(0, e, 0)) - map(position - float3(0, e, 0));
+    n.z = map(position + float3(0, 0, e)) - map(position - float3(0, 0, e));
+    return normalize(n);
+                
+    
+}
+
+float rayMarch(float3 rayOrigin, float3 rayDirection)
+{
+     float dist = 0.0;
+
+    // TODO: implement the raymarching function. Think - when do we need to break?
+    for (int i = 0; i < MAX_STEPS; i++)
+    {
+        float3 currentPosition = rayOrigin + rayDirection * dist;
+        float distanceToScene = map(currentPosition);
+        if (distanceToScene < SURF_DIST)
+        {
+            return dist;
+        }
+        dist += distanceToScene;
+        if (dist >= MAX_DIST)
+        {
+            return MAX_DIST;
+        }
+    }
+    return MAX_DIST;
+
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarch (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    
+    uint numberOfLevels = (uint)floor(log2((float)width)) + 1;
+    
+    if (id.x >= width || id.y >= height) { return; }
+
+    // --- Screen to World Ray ---
+    float2 uv = float2((id.xy + 0.5) / float2(width, height) * 2.0 - 1.0);
+    float4 clipPos = float4(uv, 0, 1);
+    float4 viewPos = mul(_InvProjectionMatrix, clipPos);
+    viewPos /= viewPos.w;
+    float3 rayDirection = normalize(mul((float3x3)_InvViewMatrix, viewPos.xyz));
+    float3 rayOrigin = _WorldSpaceCameraPos;
+
+    // --- Rendering ---
+    float dist = rayMarch(rayOrigin, rayDirection);
+    float3 finalColor = float3(0, 0, 0);
+
+    if (dist < MAX_DIST)
+    {
+        float3 position = rayOrigin + rayDirection * dist;
+        float3 normal = getNormal(position);
+        float3 reflectDir = reflect(rayDirection, normal);
+        float cosTheta = max(dot(normal, reflectDir), 0.0);
+
+        float rough = _Roughness + 1e-4;
+        float perceptualRoughness = rough * rough;
+        float3 F0 = lerp(float3(0.04, 0.04, 0.04), float3(1, 1, 1), _Metallic);
+        
+        float3 F = fresnelSchlickRoughness(cosTheta, F0, rough);
+        float3 kD = (1.0 - F) * (1.0 - _Metallic);
+
+        float3 specularBRDF = EnvironmentBRDF(perceptualRoughness, cosTheta, F0);
+        float3 prefilteredColor = _EnvTex.SampleLevel(sampler_EnvTex, reflectDir, perceptualRoughness * numberOfLevels).rgb;
+        
+        finalColor = (kD * RenderSHLighting(normal, _SHCoefficients)) + (prefilteredColor * specularBRDF);
+    }
+    else
+    {
+        finalColor = _EnvTex.SampleLevel(sampler_EnvTex, rayDirection, 0).rgb;
+    }
+
+    Result[id.xy] = float4(finalColor, 1.0);
+}
